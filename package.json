@@ -1,0 +1,43 @@
+{
+    "name": "@laver/mcp",
+    "version": "0.2.0",
+    "description": "MCP server for Laver \u2014 drive kanban boards, tickets and the wiki from an agent.",
+    "license": "MIT",
+    "type": "module",
+    "main": "server.js",
+    "bin": {
+        "laver-mcp": "server.js"
+    },
+    "files": [
+        "server.js",
+        "README.md",
+        "LICENSE"
+    ],
+    "homepage": "https://laver.app",
+    "author": "Developyn",
+    "scripts": {
+        "check": "node check.js",
+        "check:live": "node check.js --live-api",
+        "start": "node server.js"
+    },
+    "keywords": [
+        "mcp",
+        "modelcontextprotocol",
+        "model-context-protocol",
+        "laver",
+        "kanban",
+        "project-management",
+        "agent",
+        "llm"
+    ],
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "1.30.0",
+        "zod": "4.4.3"
+    },
+    "engines": {
+        "node": ">=24"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}
