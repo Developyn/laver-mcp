@@ -1,6 +1,8 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "maintainers": ["melvyn-developyn"],
+  "maintainers": [
+    "melvyn-developyn"
+  ],
   "name": "laver-mcp",
   "title": "Laver",
   "description": "Kanban boards, sprints, tickets, comments, attachments and a team wiki on laver.app. Every tool is a thin call to the public REST API; writes carry a version, so concurrent agents get a 409 to re-read and retry instead of silently overwriting each other.",
@@ -21,5 +23,13 @@
     "wiki",
     "productivity",
     "agent-workflow"
+  ],
+  "related_servers": [
+    "dearlordylord/huly-mcp",
+    "bivex/kanboard-mcp",
+    "agrath/Trello-Desktop-MCP",
+    "tacticlaunch/mcp-linear",
+    "alex13slem/openproject-codex-plugin",
+    "davegomez/fizzy-mcp"
   ]
 }
