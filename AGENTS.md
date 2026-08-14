@@ -16,6 +16,17 @@ Source of truth for the server is the private Laver monorepo at `mcp/`. Changes 
 
 Node 24 is the floor in `engines`.
 
+The `Dockerfile` is repo-only and is not published to npm. It exists because directory listings (Glama) build the server and probe it. Build and probe it the same way they do:
+
+```bash
+docker build -t laver-mcp .
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | docker run -i --rm laver-mcp
+```
+
+That must return all tools **without** `LAVER_API_KEY` set — the key is only needed once a tool actually calls the API. A server that refused to start without credentials would fail the listing checks.
+
 ## Git rules
 
 - Commit only when explicitly asked, and stage only intended files.
