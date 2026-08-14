@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.developyn/laver-mcp",
+  "name": "io.github.Developyn/laver-mcp",
   "description": "Kanban boards, sprints, tickets and a team wiki, with versioned writes for concurrent agents.",
   "websiteUrl": "https://laver.app",
   "repository": {
     "url": "https://github.com/Developyn/laver-mcp",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@laver/mcp",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "transport": {
         "type": "stdio"
       },
