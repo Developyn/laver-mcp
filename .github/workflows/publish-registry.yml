@@ -1,0 +1,100 @@
+# List this server in the official MCP registry, without holding a secret.
+#
+# The registry proves who you are in one of four ways. Three are awkward here:
+# interactive GitHub login needs a person at a browser, DNS and HTTP auth would
+# claim the `app.laver` namespace and need a TXT record kept alive forever. The
+# fourth, OIDC from GitHub Actions, needs nothing kept anywhere — this workflow
+# asks GitHub for a short-lived token, and the registry checks that the token
+# came from Developyn/laver-mcp before believing a claim on
+# `io.github.developyn/*`. That is why `id-token: write` is below and why no
+# secret is.
+#
+# Publishing is deliberately manual. The registry is a public catalogue and a
+# release there is not part of merging a change, so nothing here fires on push.
+#
+# The order that matters: publish to npm FIRST, then run this. The registry
+# stores a pointer to the npm package rather than a copy of it, so a version
+# listed here that npm does not have is a listing that resolves to nothing.
+# Step "Check npm has this version" is what stops that.
+
+name: Publish to MCP registry
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: Publish server.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      # The whole authentication story. `contents: read` is the checkout.
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # server.json, package.json and the registry all have to agree, and they
+      # drift silently: bumping package.json without server.json publishes a
+      # listing pointing at the previous release, which still resolves and is
+      # therefore never noticed.
+      - name: Check server.json and package.json agree
+        run: |
+          server_version=$(jq -r '.version' server.json)
+          package_version=$(jq -r '.version' package.json)
+          server_package=$(jq -r '.packages[0].version' server.json)
+          echo "server.json: $server_version (package entry $server_package)"
+          echo "package.json: $package_version"
+          if [ "$server_version" != "$package_version" ] \
+            || [ "$server_package" != "$package_version" ]; then
+            echo "::error::server.json and package.json disagree about the version."
+            exit 1
+          fi
+
+      # A pointer to a version npm does not have is worse than no listing: it
+      # looks live and installs nothing.
+      - name: Check npm has this version
+        run: |
+          version=$(jq -r '.version' package.json)
+          if ! npm view "@laver/mcp@${version}" version > /dev/null 2>&1; then
+            echo "::error::@laver/mcp@${version} is not on npm. Publish there first."
+            exit 1
+          fi
+          echo "@laver/mcp@${version} is on npm."
+
+      # The registry also checks that the npm package itself claims this name,
+      # via the mcpName field in its package.json. Without it, publishing is
+      # refused as an unproven claim on the namespace.
+      - name: Check the npm package claims this name
+        run: |
+          version=$(jq -r '.version' package.json)
+          expected=$(jq -r '.name' server.json)
+          actual=$(npm view "@laver/mcp@${version}" mcpName 2>/dev/null || true)
+          echo "server.json name: $expected"
+          echo "npm mcpName:      ${actual:-<missing>}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::npm mcpName does not match server.json name."
+            exit 1
+          fi
+
+      - name: Install mcp-publisher
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+        run: |
+          curl -fsSL -o publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          tar xzf publisher.tar.gz mcp-publisher
+          ./mcp-publisher --help > /dev/null
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+      - name: Authenticate with the registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish

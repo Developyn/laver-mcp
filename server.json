@@ -1,0 +1,45 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.developyn/laver-mcp",
+  "description": "Kanban boards, sprints, tickets and a team wiki, with versioned writes for concurrent agents.",
+  "websiteUrl": "https://laver.app",
+  "repository": {
+    "url": "https://github.com/Developyn/laver-mcp",
+    "source": "github"
+  },
+  "version": "0.3.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@laver/mcp",
+      "version": "0.3.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "LAVER_API_KEY",
+          "description": "A workspace-scoped API key, created in Laver under Admin → API keys. It acts as the person who created it, so it holds exactly their access and can be revoked without touching their account. Supply this or LAVER_API_KEY_FILE.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "LAVER_API_KEY_FILE",
+          "description": "Alternative to LAVER_API_KEY: a path to a file holding nothing but the key, or a .env-style file carrying a LAVER_API_KEY= line. Use this to keep the key out of your client's config file.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        },
+        {
+          "name": "LAVER_API_URL",
+          "description": "Overrides the API host. Defaults to https://api.laver.app, and must be https except for localhost.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "default": "https://api.laver.app"
+        }
+      ]
+    }
+  ]
+}
