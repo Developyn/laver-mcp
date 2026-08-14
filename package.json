@@ -1,8 +1,14 @@
 {
     "name": "@laver/mcp",
-    "version": "0.2.0",
+    "version": "0.3.0",
+    "mcpName": "io.github.developyn/laver-mcp",
     "description": "MCP server for Laver \u2014 drive kanban boards, tickets and the wiki from an agent.",
     "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Developyn/laver-mcp.git"
+    },
+    "bugs": "https://github.com/Developyn/laver-mcp/issues",
     "type": "module",
     "main": "server.js",
     "bin": {

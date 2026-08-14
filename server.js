@@ -360,11 +360,31 @@ const tool = (name, description, schema, handler) =>
     },
   );
 
+/* The three parameters that appear on most tools, described once. They carry
+ * the whole read-before-write contract between them, and a parameter an agent
+ * has to infer from its name is one it eventually infers wrongly — `version`
+ * especially, which looks optional and is not. Same reasoning as
+ * POSITION_HINT further down. */
+const TASK_UUID = z
+  .string()
+  .uuid()
+  .describe("The ticket's uuid, from list_tickets, get_board or search");
+const BOARD_UUID = z
+  .string()
+  .uuid()
+  .describe("The board's uuid, from list_boards");
+const TICKET_VERSION = z
+  .number()
+  .int()
+  .describe(
+    "The `version` from the ticket as you last read it. Not a number you choose or increment: send back exactly what get_ticket gave you. If somebody else has written since, the call answers 409 rather than overwriting them — re-read with get_ticket and retry against the new version.",
+  );
+
 // --- Reading ---------------------------------------------------------------
 
 tool(
   "list_workspaces",
-  "List the workspaces this API key can act in. Start here if you do not know the workspace uuid.",
+  "The workspaces this key can act in, with their uuids, names and the role it holds in each. Start here when you do not already have a workspace uuid, then go to list_boards. Through an API key this is always exactly one workspace — the one the key was issued for — even when the person who created it belongs to several, so a single entry is the normal answer rather than a sign of missing access. Archived workspaces are not in it. Each entry carries `billing_status`, which is how you tell a workspace that has gone read-only from one you can still write to, before a write fails rather than after.",
   {},
   async () => request("GET", "/workspaces"),
 );
@@ -377,35 +397,171 @@ tool(
     request("GET", `/workspaces/${workspace_uuid}/boards`),
 );
 
+/**
+ * A board sends every label twice: once in the board-level dictionary and again
+ * expanded in full on every ticket that carries it — uuid, name, colour and both
+ * timestamps, byte for byte the dictionary entry. Measured on this board on
+ * 8 Aug 2026: 69 labels in the dictionary, 233 inline copies, none absent from
+ * the dictionary and none differing from it in any value. As bare uuids that is
+ * 30,536 bytes off a 187,089-byte reply, 16.3%, with nothing lost, because the
+ * dictionary travels in the same payload.
+ *
+ * The bytes are the smaller half. `label_uuids` is what `update_ticket` TAKES,
+ * and `labels` is what every read GAVE — so read → modify → write, the commonest
+ * write on a board, silently stripped somebody's label unless the caller
+ * remembered to map `labels[].uuid` by hand. `label_uuids: undefined` is not an
+ * error; it reads as "no labels" and the write succeeds. Handing back the field
+ * the write takes makes the round trip correct by default rather than correct by
+ * documentation.
+ *
+ * DELIBERATELY only here, and not in `result()` where the editor-only fields are
+ * stripped. `list_tickets` and `get_ticket` carry no label dictionary beside
+ * their tasks, so rewriting there would replace names and colours with uuids
+ * that resolve to nothing — a real loss rather than a saving. This reply is the
+ * one that has both halves.
+ */
+const board_label_uuids = (board) => {
+  const dictionary = new Set((board?.labels || []).map((label) => label.uuid));
+  // Only when every inline label is genuinely in the dictionary. If one is not,
+  // the expanded copy is the only place its name exists and dropping it would
+  // lose information — so the reply is left exactly as it arrived.
+  const resolvable = (board?.tasks || []).every((task) =>
+    (task.labels || []).every((label) => dictionary.has(label?.uuid)),
+  );
+  if (!board?.labels?.length || !resolvable) return board;
+  return {
+    ...board,
+    tasks: board.tasks.map(({ labels, ...task }) => ({
+      ...task,
+      label_uuids: (labels || []).map((label) => label.uuid),
+    })),
+  };
+};
+
+/**
+ * --- The size knobs -------------------------------------------------------
+ *
+ * `get_board`, `get_wiki_tree` and `list_tickets` are the calls an agent cannot
+ * route around: a `status_uuid`, a `label_uuid` or a `custom_field` uuid comes
+ * from `get_board` and nowhere else, and a `page_uuid` comes from
+ * `get_wiki_tree` or a `search_wiki` hit. Measured against the Laver board on
+ * 8 Aug 2026, through this file: `get_board` 153,811 bytes (159 tasks),
+ * `get_wiki_tree` 118,982 bytes (212 pages), `list_tickets(status:"To Do")`
+ * 185,387 bytes (46 tickets). That is ~30-45k tokens each, spent to learn one
+ * uuid.
+ *
+ * Two rules hold this to something safe, and both are asserted in `check.js`:
+ *
+ *  1. **Every knob is opt-in.** A call that passes none of them returns
+ *     byte-identical output to the call that could not pass them, so no
+ *     existing caller changes behaviour. `without_key` below is written so the
+ *     untouched path returns the SAME OBJECT, not a rebuilt copy.
+ *  2. **MCP-side, not API-side.** These filter the parsed reply here rather
+ *     than adding query parameters to the REST routes. The cost being paid is
+ *     the tool result a model reads, the browser shares those routes, and the
+ *     API side would still need this passthrough to reach an agent. There is
+ *     no bandwidth saving between this server and the API — deliberately, in
+ *     exchange for zero risk to every other consumer.
+ *
+ * Resisted on purpose: a general `fields=`/`expand=` mini-language. Three
+ * parameters solve the problem and have a schema a model can read.
+ */
+
+/** Drop one key from an object, returning the SAME object when not dropping. */
+const without_key = (value, key, drop) =>
+  drop && value && typeof value === "object" && key in value
+    ? Object.fromEntries(Object.entries(value).filter(([k]) => k !== key))
+    : value;
+
 tool(
   "get_board",
-  "A board with its status columns, labels, members and tickets. The status uuids returned here are what create_ticket and move_ticket expect.",
-  { board_uuid: z.string().uuid() },
-  async ({ board_uuid }) => request("GET", `/boards/${board_uuid}`),
+  "A board with its status columns, labels, members and tickets. The status uuids returned here are what create_ticket and move_ticket expect. Each ticket carries `label_uuids` — bare uuids, resolvable against the board's `labels` list in the same reply — which is exactly the field `update_ticket` takes, so a label read from here can be written straight back without remapping. Note that `list_tickets` and `get_ticket` still return expanded `labels` objects, because neither reply has the dictionary to resolve uuids against. The tickets are around 90% of this reply, so pass `include_tasks: false` when you came for the uuids.",
+  {
+    board_uuid: BOARD_UUID,
+    include_tasks: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set false to leave the tickets out and get the board's structure alone — statuses, labels, members, custom fields and `server_time`. That is what you want when you called this for a status_uuid or a label_uuid, and it is roughly a tenth of the bytes. Defaults to true, and the reply with it left out is unchanged. Use list_tickets when you want the tickets, since that one takes `limit` and `status`.",
+      ),
+  },
+  async ({ board_uuid, include_tasks }) =>
+    without_key(
+      board_label_uuids(await request("GET", `/boards/${board_uuid}`)),
+      "tasks",
+      include_tasks === false,
+    ),
 );
 
 tool(
   "list_tickets",
-  "Tickets on a board, optionally filtered. `updated_since` with the cursor from a previous call is how you follow a board without re-reading all of it.",
+  "Tickets on a board, in board order, optionally filtered by status or by free text. This is what to read a column or walk a whole board with; get_board returns the same tickets but takes neither `limit` nor a cursor. Paging: `limit` defaults to 50 and caps at 200, and `next_cursor` comes back only on a FULL page — a short page is the end of the walk, so stop when it is absent instead of calling again, and pass it back verbatim when it is there. Following a board over time: send the `server_time` from a previous reply as `updated_since` and you get only what changed since, plus `removed_task_uuids` for tickets that left the board or went out of view. Use the server's clock for that rather than your own, which is the whole point of `server_time` — your clock can drift and silently skip a ticket. Archived tickets are never returned.",
   {
-    board_uuid: z.string().uuid(),
+    board_uuid: z
+      .string()
+      .uuid()
+      .describe("The board to read, from list_boards"),
     q: z
       .string()
       .optional()
       .describe(
-        "Free-text search over titles and descriptions, ranked by relevance. Whole words and prefixes, not mid-word substrings. A uuid, or the first few characters of one, finds that ticket. A ranked reply cannot be paged, so this cannot be combined with cursor.",
+        "Free-text search over titles and descriptions, ranked by relevance. Whole words and prefixes, not mid-word substrings. A ranked reply cannot be paged, so this cannot be combined with cursor. A UUID, or its first eight characters or more, is not searched for — it is RESOLVED: you get the ticket with that uuid and nothing else, and an empty list if there is none. It never falls back to text search, so a uuid that matches nothing means no such ticket rather than 'here are some tickets that mention it'. That sentence used to read 'a uuid finds that ticket' and was wrong in the way that costs you an afternoon: it was ranked text matching, so asking for a uuid returned every ticket whose prose quoted it — commonplace on a board where tickets cross-reference each other — with the one you asked for ranked LAST. Archived tickets are still not returned, by uuid or by text.",
       ),
-    status: z.string().optional().describe("Status column name"),
-    status_uuid: z.string().uuid().optional(),
+    status: z
+      .string()
+      .optional()
+      .describe(
+        "A status column's name, as shown on the board — 'To Do', 'In progress'. Matched against that board's columns, so a name from another board is a 400 rather than an empty list. Use status_uuid instead when you already hold the uuid, and do not send both.",
+      ),
+    status_uuid: z
+      .string()
+      .uuid()
+      .optional()
+      .describe(
+        "A status column's uuid, from get_board. The exact form of `status`, and the one to prefer once you have read the board, since it survives a column being renamed.",
+      ),
     updated_since: z
       .string()
       .optional()
-      .describe("ISO timestamp, or the cursor from a previous call"),
-    limit: z.number().int().min(1).max(200).optional(),
-    cursor: z.string().optional(),
+      .describe(
+        "Return only tickets changed after this moment: an ISO 8601 timestamp, or — better — the `server_time` from a previous reply, which is the server's own clock and cannot drift against it. The reply then also carries `removed_task_uuids`, the tickets that left the board or went out of view since, which is the only way to notice a deletion by polling.",
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe(
+        "Tickets per page, 1 to 200. Defaults to 50. A reply holding exactly this many is a full page and carries a `next_cursor`; anything shorter is the last page.",
+      ),
+    cursor: z
+      .string()
+      .optional()
+      .describe(
+        "The `next_cursor` from the previous page, passed back unchanged. It encodes a position on the board, so it is only meaningful for the same board and the same filters — do not build one yourself or reuse one across a different query, and a cursor Laver cannot read is a 400. Cannot be combined with `q`: ranked results have no stable order to page through, and asking for both is a 400 telling you so.",
+      ),
+    include_descriptions: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set false to leave `description` off every ticket, keeping titles, statuses, labels and uuids. Bodies are around 78% of a column listing, and you have not chosen a ticket to read yet — get_ticket has the full one. Defaults to true, and the reply with it left out is unchanged.",
+      ),
   },
-  async ({ board_uuid, ...query }) =>
-    request("GET", `/boards/${board_uuid}/tasks`, { query }),
+  async ({ board_uuid, include_descriptions, ...query }) => {
+    const reply = await request("GET", `/boards/${board_uuid}/tasks`, {
+      query,
+    });
+    // `!Array.isArray` and not `|| []`: with `updated_since` this route answers
+    // a delta, and inventing an empty `tasks` on a reply that did not carry one
+    // would be a shape change made by a parameter that promises not to make any.
+    if (include_descriptions !== false || !Array.isArray(reply.tasks))
+      return reply;
+    return {
+      ...reply,
+      tasks: reply.tasks.map((task) => without_key(task, "description", true)),
+    };
+  },
 );
 
 tool(
@@ -427,8 +583,13 @@ tool(
 
 tool(
   "get_ticket",
-  "One ticket in full, including its `version`. Every write needs that version, so read before you write.",
-  { task_uuid: z.string().uuid() },
+  "One ticket in full: its fields, its `subtasks`, its expanded `labels` objects, and the `version` every write needs. Read this before you write. update_ticket, move_ticket, archive_ticket and the rest all take that version and answer 409 if it has moved on since you read it — that 409 is the signal to call this again and retry against the fresh version, never to drop the version or force the write. `labels` arrive expanded rather than as bare uuids because this reply carries no board dictionary to resolve them against; get_board returns `label_uuids` instead, and that bare-uuid shape is the one update_ticket wants. A ticket you cannot open answers 404, the same 404 as one that never existed, so a 404 here is not proof the ticket is gone.",
+  {
+    task_uuid: z
+      .string()
+      .uuid()
+      .describe("The ticket's uuid, from list_tickets, get_board or search"),
+  },
   async ({ task_uuid }) => request("GET", `/tasks/${task_uuid}`),
 );
 
@@ -459,7 +620,7 @@ tool(
   "get_ticket_attachment",
   "Fetch one attachment's CONTENT, having found its uuid with list_ticket_attachments. What comes back depends on what the file is, because a tool result is text and most files are not: a text or CSV attachment is returned inline as text; an image is returned as an image block, which is the only form the model can actually look at; anything else — a PDF, a spreadsheet, a document — cannot cross this boundary as text at all, and needs `save_to`. Pass `save_to` for any file you want on disk, and for anything large: it writes the bytes to that path on the machine THIS SERVER runs on (normally the same machine as the agent, since the client starts it as a subprocess) and returns the path and size instead of the content. Files over 4 MB always need `save_to`, whatever their type, because an inline result that size costs more context than the answer is worth. Missing, still uploading, deleted, or on a ticket you cannot open are all the same 404.",
   {
-    task_uuid: z.string().uuid(),
+    task_uuid: TASK_UUID,
     attachment_uuid: z.string().uuid(),
     save_to: z
       .string()
@@ -543,17 +704,61 @@ tool(
 //
 // --- Writing ---------------------------------------------------------------
 
+// Order within a column, and the only way an agent has of expressing it. Until
+// this existed the browser was the sole client that could position anything —
+// it computes a midpoint from the two cards a drag was dropped between — so
+// everything an agent created or moved sorted on a number nobody had chosen.
+// The server-side default (append) fixed where things LAND; this is how you say
+// otherwise, and it is the same field on all three tools deliberately.
+const POSITION_HINT =
+  "Sort key within the column, not an index — smaller sorts higher. Read the neighbours' `position` off get_board and send a number between them; omit it to append to the bottom. Positions come back as decimal strings ('1000.000000') and are sent as numbers.";
+
 tool(
   "create_ticket",
-  "Create a ticket. Give either `status` (the column name) or `status_uuid`; with neither it lands in the first column. Markdown in `description` is parsed — headings, lists and code fences all render.",
+  "Create a ticket on a board. Give either `status` (the column name) or `status_uuid`; with neither it lands in the first column. Markdown in `description` is parsed — headings, lists and code fences all render. It is appended to the bottom of its column unless you send a `position`. The reply is the new ticket, including the `uuid` to reference it by and the `version` any later write to it will need, so there is no need to re-read it before your next call. This tool sends no idempotency key, so calling it twice makes two tickets: on a timeout or an unclear failure, use list_tickets with `q` set to the title to see whether the first one landed before you retry.",
   {
-    board_uuid: z.string().uuid(),
-    title: z.string().min(1).max(500),
-    description: z.string().max(20000).optional(),
-    status: z.string().optional(),
-    status_uuid: z.string().uuid().optional(),
-    priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
-    due_date: z.string().optional().describe("ISO date"),
+    board_uuid: z
+      .string()
+      .uuid()
+      .describe("The board to create it on, from list_boards"),
+    title: z
+      .string()
+      .min(1)
+      .max(500)
+      .describe(
+        "The ticket's title, 1 to 500 characters. This is the whole of what shows on the card, so put the specifics here rather than in the description alone.",
+      ),
+    description: z
+      .string()
+      .max(20000)
+      .optional()
+      .describe(
+        "The body, Markdown, up to 20000 characters. Headings, lists and code fences all render.",
+      ),
+    status: z
+      .string()
+      .optional()
+      .describe(
+        "The column to place it in, by name as shown on the board. Must be a column on this board. Send this or `status_uuid`, not both; with neither it lands in the first column.",
+      ),
+    status_uuid: z
+      .string()
+      .uuid()
+      .optional()
+      .describe(
+        "The column to place it in, by uuid, from get_board. The exact form of `status` and the one to prefer once you have read the board, since renaming a column does not break it.",
+      ),
+    priority: z
+      .enum(["low", "medium", "high", "urgent"])
+      .optional()
+      .describe(
+        "One of low, medium, high or urgent. Left off, the ticket simply has no priority set, which is not the same as low.",
+      ),
+    due_date: z
+      .string()
+      .optional()
+      .describe("Due date as an ISO 8601 date, e.g. 2026-08-14"),
+    position: z.number().optional().describe(POSITION_HINT),
   },
   async ({ board_uuid, ...body }) =>
     request("POST", `/boards/${board_uuid}/tasks`, { body }),
@@ -563,23 +768,72 @@ tool(
   "update_ticket",
   "Change a ticket. `version` must be the one from get_ticket; a 409 means somebody wrote first and you should re-read. Markdown in `description` is parsed, and it replaces the whole description rather than appending to it. `label_uuids`, `assignee_uuids` and `custom_fields` each REPLACE the whole set rather than adding to it, so send what is already on the ticket alongside what you are adding or you will silently remove the rest. `custom_fields` is keyed by the field's uuid — read them off get_ticket, since a name will not do — and a uuid no field on that board has is DROPPED SILENTLY rather than refused: the call answers 200 and the value is simply not there. The task in the reply carries the stored `custom_fields`, so read them back to confirm a write landed rather than assuming a 200 means it did.",
   {
-    task_uuid: z.string().uuid(),
-    version: z.number().int(),
-    title: z.string().min(1).max(500).optional(),
-    description: z.string().max(20000).optional(),
-    status: z.string().optional(),
-    status_uuid: z.string().uuid().optional(),
-    priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
-    due_date: z.string().nullable().optional(),
-    label_uuids: z.array(z.string().uuid()).optional(),
-    assignee_uuids: z.array(z.string().uuid()).optional(),
+    task_uuid: TASK_UUID,
+    version: TICKET_VERSION,
+    title: z
+      .string()
+      .min(1)
+      .max(500)
+      .optional()
+      .describe("Replaces the title. Omit to leave it as it is."),
+    description: z
+      .string()
+      .max(20000)
+      .optional()
+      .describe(
+        "Replaces the whole body, Markdown, up to 20000 characters — it does not append. To add a line, read the current description with get_ticket and send it back with your addition included.",
+      ),
+    status: z
+      .string()
+      .optional()
+      .describe(
+        "Move it to this column, by name as shown on the board. Send this or `status_uuid`, not both. move_ticket is the tool for a move alone.",
+      ),
+    status_uuid: z
+      .string()
+      .uuid()
+      .optional()
+      .describe(
+        "Move it to this column, by uuid, from get_board. The exact form of `status`, unaffected by a column being renamed.",
+      ),
+    priority: z
+      .enum(["low", "medium", "high", "urgent"])
+      .optional()
+      .describe(
+        "One of low, medium, high or urgent. Omit to leave it alone; there is no value here that clears a priority already set.",
+      ),
+    due_date: z
+      .string()
+      .nullable()
+      .optional()
+      .describe(
+        "Due date as an ISO 8601 date, e.g. 2026-08-14. Explicit null clears it; omitting it leaves it unchanged. Those are different, so do not send null to mean 'no change'.",
+      ),
+    label_uuids: z
+      .array(z.string().uuid())
+      .optional()
+      .describe(
+        "The ticket's labels, as the complete set after the write — it REPLACES rather than adds, so include the ones already on the ticket or you remove them. Bare uuids, which is the shape get_board returns as `label_uuids`; get_ticket returns expanded objects, so take the uuid out of each. An empty array removes every label.",
+      ),
+    assignee_uuids: z
+      .array(z.string().uuid())
+      .optional()
+      .describe(
+        "The ticket's assignees, as the complete set after the write — it REPLACES rather than adds, so include whoever is already assigned. The uuids come from the board's `members`. An empty array unassigns everyone.",
+      ),
     // Deliberately as loose as the route's own schema — `typebox.Record(
     // typebox.String(), typebox.Unknown())` at backend/tasks/index.js:1754.
     // A stricter shape here (uuid keys, string values) would be this server
     // refusing calls the API accepts, which is the drift check.js exists to
     // catch: a field type added to the backend would start failing at the tool
     // while every existing call went on working, and nothing would say why.
-    custom_fields: z.record(z.string(), z.unknown()).optional(),
+    custom_fields: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        "Custom field values, keyed by the FIELD's uuid — read them off get_ticket, a field's name will not work. REPLACES the whole set, so send the values already on the ticket alongside the ones you are changing. A key no field on that board has is dropped silently: the call still answers 200 and the value is simply absent, so read `custom_fields` back off the reply to confirm the write landed.",
+      ),
+    position: z.number().optional().describe(POSITION_HINT),
   },
   async ({ task_uuid, ...body }) =>
     request("PATCH", `/tasks/${task_uuid}`, { body }),
@@ -587,12 +841,13 @@ tool(
 
 tool(
   "move_ticket",
-  'Move a ticket to another column. Give either `status` (the column name) or `status_uuid` — with NEITHER this is a 400 ("body must NOT have fewer than 2 properties") and not a no-op, and with both it is a 400 saying to pick one. A column name is matched case-insensitively and trimmed, so "to do" finds "To Do", but a name no column has is a 400 naming it, and a `status_uuid` belonging to another board is refused too — get_board is where both come from. `version` must be the one get_ticket returned; a stale one is a 409 that carries the current version with it, so the retry does not need another read.',
+  'Move a ticket to another column. Give either `status` (the column name) or `status_uuid` — with NEITHER this is a 400 ("body must NOT have fewer than 2 properties") and not a no-op, and with both it is a 400 saying to pick one. A column name is matched case-insensitively and trimmed, so "to do" finds "To Do", but a name no column has is a 400 naming it, and a `status_uuid` belonging to another board is refused too — get_board is where both come from. `version` must be the one get_ticket returned; a stale one is a 409 that carries the current version with it, so the retry does not need another read. The ticket is appended to the bottom of the column it arrives in unless you send a `position`; it does not keep the number it had in the column it left.',
   {
-    task_uuid: z.string().uuid(),
-    version: z.number().int(),
+    task_uuid: TASK_UUID,
+    version: TICKET_VERSION,
     status: z.string().optional().describe("Target column name"),
     status_uuid: z.string().uuid().optional(),
+    position: z.number().optional().describe(POSITION_HINT),
   },
   async ({ task_uuid, ...body }) =>
     request("POST", `/tasks/${task_uuid}/move`, { body }),
@@ -602,7 +857,7 @@ tool(
   "comment_on_ticket",
   "Add a comment to a ticket. Markdown in `body` is parsed — headings, lists and code fences all render. Comments are not versioned: this takes no `version` and cannot 409, so it is the one write that is always safe to make against a ticket somebody else is editing, and it is the right way to report something rather than editing the description out from under them. It is also the write a read-only key can still make — a `commenter` role is refused update_ticket and move_ticket with a 403 but allowed this. A ticket you cannot open is a 404. Posting does not mark the thread read on your behalf.",
   {
-    task_uuid: z.string().uuid(),
+    task_uuid: TASK_UUID,
     body: z.string().min(1).max(20000),
   },
   async ({ task_uuid, body }) =>
@@ -647,7 +902,7 @@ tool(
   "upload_ticket_attachment",
   `Attach a file to a ticket — the way an agent puts evidence on a ticket rather than describing it. Two ways to give it the bytes, and exactly one must be used. \`file_path\` reads a file from the machine THIS SERVER runs on (normally the agent's own machine, since the client starts this as a subprocess) and is the right one for anything that already exists on disk; it costs no context, so prefer it. \`text\` is for content the agent has just written — a log, a CSV, a diff — and needs \`filename\` alongside it. Laver refuses anything that is not one of ${UPLOADABLE_TYPES.join(", ")}, and refuses a file whose BYTES do not match the type its name claims, so renaming a zip to .png fails at the server rather than here. 25 MB is the ceiling. A workspace over its storage quota is a 402, which no retry fixes. Uploading is a write: a read-only role is a 403.`,
   {
-    task_uuid: z.string().uuid(),
+    task_uuid: TASK_UUID,
     file_path: z
       .string()
       .optional()
@@ -722,7 +977,7 @@ tool(
   "delete_ticket_attachment",
   "Remove a file from a ticket. This is the same one-way-but-recoverable move archive_ticket makes: the attachment leaves the ticket immediately and its bytes sit in the workspace trash for 30 days, after which the sweep destroys them. There is no tool here to restore one — that is the web app — so treat it as final in an agent's hands. The freed bytes stop counting against the workspace's storage quota straight away. An attachment already deleted, still uploading, or on a ticket this key cannot open are all the same 404, so this never confirms that a file existed.",
   {
-    task_uuid: z.string().uuid(),
+    task_uuid: TASK_UUID,
     attachment_uuid: z.string().uuid(),
   },
   async ({ task_uuid, attachment_uuid }) =>
@@ -768,7 +1023,7 @@ tool(
     // wiki_page — and taking the kind here would quietly make this one tool
     // that also permanently destroys wiki pages, a far larger blast radius than
     // its name admits to.
-    task_uuid: z.string().uuid(),
+    task_uuid: TASK_UUID,
   },
   async ({ workspace_uuid, task_uuid }) =>
     request(
@@ -781,9 +1036,23 @@ tool(
   "link_tickets",
   'Record that one ticket must be finished before another can start. Direction is from the point of view of task_uuid: "blocks" means task_uuid has to be done first. Every ticket read afterwards carries `blocked_by`, `blocks` and `is_blocked`, so this is how you work out what order to do things in.',
   {
-    task_uuid: z.string().uuid(),
-    other_task_uuid: z.string().uuid(),
-    direction: z.enum(["blocks", "blocked_by"]),
+    task_uuid: z
+      .string()
+      .uuid()
+      .describe(
+        "The ticket the link is stated from, and the one `direction` is read relative to. Swapping this with other_task_uuid reverses the meaning, so decide which end you are describing before you call.",
+      ),
+    other_task_uuid: z
+      .string()
+      .uuid()
+      .describe(
+        "The ticket at the far end of the link. Must be a different ticket from task_uuid.",
+      ),
+    direction: z
+      .enum(["blocks", "blocked_by"])
+      .describe(
+        "Read from task_uuid's side: 'blocks' means task_uuid must be finished before other_task_uuid can start; 'blocked_by' means the reverse. Unlink with unlink_tickets.",
+      ),
   },
   async ({ task_uuid, ...body }) =>
     request("POST", `/tasks/${task_uuid}/relationships`, { body }),
@@ -792,7 +1061,7 @@ tool(
 tool(
   "unlink_tickets",
   "Remove the link between two tickets. Order does not matter — it finds the pair from either end, so you do not have to know which one is recorded as the blocker. Note what it removes: Laver can hold more than one kind of link between the same pair (a dependency, a related-to, a duplicate-of), a person can add the other kinds in the web app, and this removes ALL of them rather than only the dependency link_tickets creates. It is not an error to unlink a pair that was never linked — nothing matches, nothing is removed, and the call still succeeds — so this cannot be used to test whether a link exists; read `blocked_by` and `blocks` on the ticket for that. Either uuid being unreadable, on a board you cannot open, or nonexistent is a 404.",
-  { task_uuid: z.string().uuid(), other_task_uuid: z.string().uuid() },
+  { task_uuid: TASK_UUID, other_task_uuid: z.string().uuid() },
   async ({ task_uuid, other_task_uuid }) =>
     request("DELETE", `/tasks/${task_uuid}/relationships/${other_task_uuid}`),
 );
@@ -855,13 +1124,30 @@ const TRIGGER_TYPES = [
   // require trigger_config.
   "schedule",
   "ticket.due",
+  // The third swept one: "this ticket has been in Review for three days" is a
+  // state, not an occurrence, so nothing emits it either. Needs
+  // {status_uuid, days} in trigger_config.
+  "ticket.in_column",
+  // The fourth, and the only trigger that is about ONE ticket rather than
+  // whatever caused it: "move this ticket into Review the moment Review is
+  // empty". Needs {status_uuid} in trigger_config AND a `task_uuid` on the rule
+  // saying which ticket moves — every other trigger refuses a task_uuid,
+  // because the ticket it acts on is the one that set it off.
+  "column.empty",
+  // Neither an event nor a sweep. A `manual` rule is a button in the ticket
+  // dialog and runs only when a person presses it — so an agent CAN create one
+  // and cannot fire one: the press is POST .../run, which has no tool. That is
+  // the safest rule an agent can arm, and worth saying rather than leaving to
+  // be inferred, because it is the one trigger whose absence of a firing tool
+  // is a feature.
+  "manual",
 ];
 
 // The condition vocabulary, which is a closed list for the same reason and is
 // checked against the same catalogue. Operators differ per field — `title`
-// cannot be asked `is`, `due_date` can only be asked whether it is set — so the
-// schema takes the union and the route refuses the combinations that make no
-// sense, with the operators that field does take in the message.
+// cannot be asked `is`, `due_date` can only be asked whether it is set or has
+// passed — so the schema takes the union and the route refuses the combinations
+// that make no sense, with the operators that field does take in the message.
 const CONDITION_FIELDS = [
   "status",
   "priority",
@@ -878,6 +1164,8 @@ const CONDITION_OPERATORS = [
   "has_not",
   "is_set",
   "is_not_set",
+  "has_passed",
+  "has_not_passed",
   "contains",
   "not_contains",
 ];
@@ -911,9 +1199,9 @@ tool(
 
 tool(
   "create_automation",
-  "Create an automation rule on a board from a trigger, one to twenty actions, and optional conditions. READ THIS BEFORE CALLING IT: the rule runs as the user this API key acts as, every time it is triggered, for as long as it exists — a standing grant of that person's permissions to anybody who can cause the trigger, not a one-off write like every other tool here, and the resulting history is attributed to them. This one takes effect immediately: the rule is live as soon as it is created and fires on its trigger within a couple of seconds, so do not create one speculatively to see what it would do. Creating one requires a workspace OWNER or ADMIN — a member who can otherwise write on the board is a 403 and retrying cannot fix it. A 402 means the plan's per-board rule limit is already reached (two on free) and nothing was created. Conditions are a flat AND of field/operator/value tests and every one must hold; the operators a field accepts differ, so `title contains x` is valid where `title is x` is a 400 listing the operators title takes. `run_as_user_uuid` defaults to the key's own user, and naming somebody else is refused unless they are an active member who can write and can see the board. Rules arrive switched on unless you pass `enabled: false`. The `schedule` and `ticket.due` triggers are not events and REQUIRE `trigger_config`: a schedule fans out over every ticket the conditions select at its appointed time, in UTC, so give it conditions unless you really mean the whole board; a due-date rule fires once per ticket per threshold and never retroactively, so creating one does nothing to work that is already overdue. `create_linked_ticket` is the exception to all of that: it CREATES a ticket rather than changing the triggering one, it needs a `title` (templated, so `{{now}}` makes a weekly checklist a new ticket each week) and takes an optional `description`, `status_uuid` and `relationship` (blocks, blocked_by, related_to, duplicate_of, stated from the new ticket's point of view). A schedule rule whose actions are ONLY this fires once for the board rather than once per ticket, which is what makes \"every Monday, create the release checklist\" work — and such a rule is refused if it also carries conditions, a relationship, or any action that acts on a ticket, because none of those has a ticket to be about. A ticket-triggered rule using it feeds itself, and is stopped by the depth cap after three chained runs rather than looping.",
+  "Create an automation rule on a board from a trigger, one to twenty actions, and optional conditions. READ THIS BEFORE CALLING IT: the rule runs as the user this API key acts as, every time it is triggered, for as long as it exists — a standing grant of that person's permissions to anybody who can cause the trigger, not a one-off write like every other tool here, and the resulting history is attributed to them. This one takes effect immediately: the rule is live as soon as it is created and fires on its trigger within a couple of seconds, so do not create one speculatively to see what it would do. Creating one requires a workspace OWNER or ADMIN — a member who can otherwise write on the board is a 403 and retrying cannot fix it. A 402 means the plan's per-board rule limit is already reached (two on free) and nothing was created. Conditions are a flat AND of field/operator/value tests and every one must hold; the operators a field accepts differ, so `title contains x` is valid where `title is x` is a 400 listing the operators title takes. `run_as_user_uuid` defaults to the key's own user, and naming somebody else is refused unless they are an active member who can write and can see the board. Rules arrive switched on unless you pass `enabled: false`. The `schedule` and `ticket.due` triggers are not events and REQUIRE `trigger_config`: a schedule fans out over every ticket the conditions select at its appointed time, in UTC, so give it conditions unless you really mean the whole board; a due-date rule fires once per ticket per threshold and never retroactively, so creating one does nothing to work that is already overdue. `column.empty` is the odd one: it is about ONE ticket rather than the board, so it requires a `task_uuid` alongside `trigger_config: {status_uuid}`, and it fires the moment that column holds nothing — which may be the moment you create it, since a column that is already empty is already empty. It also keeps doing it every time that column empties again, for ever, unless you pass `run_limit`; one-off queue entries are what people usually mean, so pass `run_limit: 1` unless a standing arrangement was actually asked for. `create_linked_ticket` is the exception to all of that: it CREATES a ticket rather than changing the triggering one, it needs a `title` (templated, so `{{now}}` makes a weekly checklist a new ticket each week) and takes an optional `description`, `status_uuid` and `relationship` (blocks, blocked_by, related_to, duplicate_of, stated from the new ticket's point of view). A schedule rule whose actions are ONLY this fires once for the board rather than once per ticket, which is what makes \"every Monday, create the release checklist\" work — and such a rule is refused if it also carries conditions, a relationship, or any action that acts on a ticket, because none of those has a ticket to be about. A ticket-triggered rule using it feeds itself, and is stopped by the depth cap after three chained runs rather than looping.",
   {
-    board_uuid: z.string().uuid(),
+    board_uuid: BOARD_UUID,
     name: z.string().min(1).max(200),
     trigger_type: z.enum(TRIGGER_TYPES),
     trigger_config: z
@@ -939,10 +1227,17 @@ tool(
           .describe(
             "ticket.due only, and only with before/after — arrives takes no days",
           ),
+        status_uuid: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            "ticket.in_column and column.empty only: the column being waited on",
+          ),
       })
       .optional()
       .describe(
-        'Required for the schedule and ticket.due triggers and ignored by every other one. A schedule needs {interval, at}; a due-date rule needs {when} plus {days} unless when is "arrives".',
+        'Required for the schedule, ticket.due, ticket.in_column and column.empty triggers and ignored by every other one. A schedule needs {interval, at}; a due-date rule needs {when} plus {days} unless when is "arrives"; a dwell rule needs {status_uuid, days}; a column.empty rule needs {status_uuid}.',
       ),
     actions: z
       .array(z.object({ type: z.enum(ACTION_TYPES) }).passthrough())
@@ -960,7 +1255,7 @@ tool(
             .union([z.string(), z.number(), z.boolean()])
             .optional()
             .describe(
-              "A uuid for status, label and assignee; one of none/low/medium/high/urgent for priority; text for title. Omitted for is_set and is_not_set, which take no value",
+              "A uuid for status, label and assignee; one of none/low/medium/high/urgent for priority; text for title. Omitted for is_set, is_not_set, has_passed and has_not_passed, which take no value",
             ),
         }),
       )
@@ -977,6 +1272,22 @@ tool(
       .describe(
         "Defaults to the user this key acts as. Read the warning above",
       ),
+    task_uuid: z
+      .string()
+      .uuid()
+      .optional()
+      .describe(
+        "column.empty only, where it is required: the ticket the rule moves. Every other trigger refuses it, since those act on the ticket that set them off. Cannot be changed afterwards — a rule about the wrong ticket has to be deleted and made again",
+      ),
+    run_limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe(
+        "column.empty only, and every other trigger refuses it. How many times the rule may move the ticket before it retires itself: a ticket can leave that column and the column can empty again, and without a limit the rule pulls it back in every time, indefinitely. Pass 1 unless a standing arrangement is what was actually asked for. A finished rule comes back from list_automations switched off with a `disabled_reason` saying so, and switching it back on does not give it more runs. Counts the runs that acted, successes and failures alike. Cannot be changed afterwards",
+      ),
   },
   async ({ board_uuid, ...body }) =>
     request("POST", `/boards/${board_uuid}/automations`, { body }),
@@ -986,13 +1297,28 @@ tool(
 
 tool(
   "list_wikis",
-  "The wikis in a workspace, with their uuids — the only place a `wiki_uuid` comes from, so every other wiki tool starts here. `workspace_uuid` is required; start from list_workspaces if you do not have one. An empty list is not proof the workspace has no wiki: a key acting as a guest is excluded from workspace-wide reads and sees nothing here.",
+  "The wikis in a workspace, with their uuids — the only place a `wiki_uuid` comes from, so every other wiki tool starts here. `workspace_uuid` is required; start from list_workspaces if you do not have one. An empty list is not proof the workspace has no wiki: a key acting as a guest is excluded from workspace-wide reads and sees nothing here. Archiving a wiki (done in the browser; there is no tool here for it) takes it out of this list entirely, along with every page under it — pass `archived: true` to see those instead, which is also the only way to find a `wiki_uuid` for restore_wiki.",
   // Not optional: `GET /wikis` requires it, so an omitted one is a 400 the
   // model reads as "there are no wikis". The schema is what stops the call
   // being made at all.
-  { workspace_uuid: z.string().uuid() },
-  async ({ workspace_uuid }) =>
-    request("GET", "/wikis", { query: { workspace_uuid } }),
+  {
+    workspace_uuid: z.string().uuid(),
+    archived: z
+      .boolean()
+      .optional()
+      .describe(
+        "Omit or false for the normal list. true swaps it for archived wikis instead — the two never mix in one reply, the same way an archived wiki never appears beside a live one in the workspace sidebar.",
+      ),
+  },
+  async ({ workspace_uuid, archived }) =>
+    request("GET", "/wikis", { query: { workspace_uuid, archived } }),
+);
+
+tool(
+  "restore_wiki",
+  "Undo an archive: brings a wiki, and every page under it, back into list_wikis and back onto the internet if any of its pages were published. `wiki_uuid` comes from list_wikis with `archived: true` — that is the only place one is visible at all, since an archived wiki is invisible everywhere else this server reads. A wiki that is not archived, one in a workspace this key cannot open, and a uuid that does not exist are all the same 404, so this never confirms that a wiki exists. There is deliberately no tool here that archives one in the first place: that half stays a browser action.",
+  { wiki_uuid: z.string().uuid() },
+  async ({ wiki_uuid }) => request("POST", `/wikis/${wiki_uuid}/restore`),
 );
 
 tool(
@@ -1003,11 +1329,69 @@ tool(
     request("GET", `/wikis/${wiki_uuid}/search`, { query: { q } }),
 );
 
+/**
+ * The tree arrives flat, depth-first, each page already carrying `depth`
+ * (0 for a top-level page) and `parent_page_uuid`. So a subtree is a contiguous
+ * scan: everything after the root until the first page back at the root's own
+ * depth or shallower. No parent map needed, and it cannot disagree with the
+ * server's ordering the way a rebuilt tree could.
+ *
+ * `depth` counts LEVELS RETURNED, not the `depth` field: `depth: 1` with no
+ * parent is the top-level pages, and with a parent it is that page alone. One
+ * meaning either way — "how many levels of nesting do I want" — rather than a
+ * number that means something different depending on the other argument.
+ */
+const prune_wiki_tree = (pages, root_uuid, levels) => {
+  let kept = pages || [];
+  let base = 0;
+  if (root_uuid !== undefined) {
+    const start = kept.findIndex((page) => page.uuid === root_uuid);
+    // Silence here would be indistinguishable from "that page has no children",
+    // and the caller would believe an empty wiki. A uuid this tree does not
+    // hold is a mistake worth saying out loud.
+    if (start === -1)
+      throw new Error(
+        `No page ${root_uuid} in this wiki. parent_page_uuid must be a page uuid from this same tree — a page in another wiki, a wiki uuid, or a page you cannot read all look like this.`,
+      );
+    base = kept[start].depth;
+    let end = start + 1;
+    while (end < kept.length && kept[end].depth > base) end += 1;
+    kept = kept.slice(start, end);
+  }
+  if (levels !== undefined)
+    kept = kept.filter((page) => page.depth - base < levels);
+  return kept;
+};
+
 tool(
   "get_wiki_tree",
-  "Every page in a wiki as a tree — titles, uuids and nesting — without any page content. This is the cheap way to find a page uuid when you know roughly where it sits; search_wiki is the way when you know roughly what it says. Follow up with get_wiki_page for the content of one. A wiki you cannot open is a 404, the same one a wiki that does not exist gives.",
-  { wiki_uuid: z.string().uuid() },
-  async ({ wiki_uuid }) => request("GET", `/wikis/${wiki_uuid}/tree`),
+  "Every page in a wiki as a tree — titles, uuids and nesting — without any page content. This is the cheap way to find a page uuid when you know roughly where it sits; search_wiki is the way when you know roughly what it says. Follow up with get_wiki_page for the content of one. A wiki you cannot open is a 404, the same one a wiki that does not exist gives. A big wiki is tens of thousands of tokens of metadata, so narrow it with `parent_page_uuid` and `depth` rather than reading all of it to find one uuid.",
+  {
+    wiki_uuid: z.string().uuid(),
+    parent_page_uuid: z
+      .string()
+      .uuid()
+      .optional()
+      .describe(
+        "Return only this page and everything nested under it. The uuid must be a page in THIS wiki — anything else is an error naming it, not an empty tree. Omit for the whole wiki.",
+      ),
+    depth: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "How many levels of nesting to return. 1 is the top level alone — the whole wiki's top-level pages, or just `parent_page_uuid` itself when one is given; 2 adds their children. Omit for every level.",
+      ),
+  },
+  async ({ wiki_uuid, parent_page_uuid, depth }) => {
+    const reply = await request("GET", `/wikis/${wiki_uuid}/tree`);
+    if (parent_page_uuid === undefined && depth === undefined) return reply;
+    return {
+      ...reply,
+      pages: prune_wiki_tree(reply.pages, parent_page_uuid, depth),
+    };
+  },
 );
 
 tool(
@@ -1092,6 +1476,9 @@ export {
   // so the check reads the values the tool actually enforces.
   UPLOADABLE_TYPES,
   MAX_UPLOAD_BYTES,
+  // For mcp/check.js: the round trip it asserts is the whole point of the
+  // rewrite, and asserting it against a hand-built board needs no network.
+  board_label_uuids,
 };
 
 /* Only connect stdio when this file is what was actually run. Imported by

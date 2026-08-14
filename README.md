@@ -89,6 +89,24 @@ and nothing else. There is no tool for the server-sent event stream at
 `GET /boards/:uuid/events` — a tool call is one request and one answer, and a
 stream that never ends is neither.
 
+**Asking for less.** A tool result is charged against the model's context, and
+three of these calls are the ones you cannot route around: a `status_uuid` or a
+`label_uuid` comes from `get_board`, and a `page_uuid` comes from
+`get_wiki_tree`. On a busy board they were 154 kB, 119 kB and 180 kB. Each now
+takes a parameter that narrows the reply, and every one of them is opt-in — a
+call that passes none of them is unchanged.
+
+| Call                                        | Gives you                                      | Measured        |
+| ------------------------------------------- | ---------------------------------------------- | --------------- |
+| `get_board(include_tasks: false)`           | the structure alone — statuses, labels, fields | 155 kB → 17 kB  |
+| `get_wiki_tree(depth: 1)`                   | the top level, nothing nested under it         | 119 kB → 1.8 kB |
+| `get_wiki_tree(parent_page_uuid: …)`        | one page and everything beneath it             | 119 kB → 9.8 kB |
+| `list_tickets(include_descriptions: false)` | titles and uuids without the bodies            | 167 kB → 45 kB  |
+
+Reach for `get_board(include_tasks: false)` whenever you called it for a uuid
+rather than for the tickets, and `list_tickets` when you want the tickets —
+that one takes `status` and `limit` as well.
+
 **Writing**
 
 | Tool                | Notes                                                                                                                          |
@@ -130,8 +148,16 @@ the screenshot somebody attached is usually the specification.
 **Wiki**
 
 `list_wikis`, `search_wiki`, `get_wiki_tree`, `get_wiki_page`,
-`get_wiki_page_version`, `append_wiki_page`, and `create_wiki_page` — which
-takes the body as markdown and nests under `parent_page_uuid`.
+`get_wiki_page_version`, `append_wiki_page`, `create_wiki_page` — which
+takes the body as markdown and nests under `parent_page_uuid` — and
+`restore_wiki`.
+
+Archiving a wiki (done in the browser; there is no tool here for it) takes it
+and every page under it out of `list_wikis` entirely. `list_wikis` takes
+`archived: true` to see those instead — the only place an archived
+`wiki_uuid` is visible at all — and `restore_wiki` is the only thing here
+that does something with one: it un-archives the wiki, and every page under
+it, in one call.
 
 `get_wiki_page_version` is how you read something that was overwritten. It is a
 read: the page does not move. There is deliberately no tool to put an old
@@ -194,17 +220,34 @@ read a ticket's attachments while every check stayed green.
   REST and no tools, so a board created here keeps its template's defaults.
 - **Labels.** `update_ticket` takes `label_uuids`; the only source of one is
   `get_board`. Nothing creates a label or lists them workspace-wide.
+- **Board templates.** A workspace can save one of its own boards as a template
+  and start the next board from it. Listing them has no tool, which is what
+  keeps the saved ones out of reach: `create_board` names the two built-in ids
+  in its schema, and a saved template's id is a uuid nothing here can discover.
+  Saving and deleting are deliberately absent rather than pending — a template
+  is workspace-wide furniture in everyone's board-create form, and adding to or
+  removing from that list is a decision taken in front of the board.
+- **Attachment thumbnails.** Deliberate, not a gap. The thumbnail route serves
+  the web client a downscaled webp so a card cover costs kilobytes instead of
+  megabytes; an agent wants the file somebody actually uploaded, and
+  `get_ticket_attachment` already returns that at full resolution in its
+  original format.
 - **Triage and board analytics.** `GET /workspaces/:uuid/tasks` answers "what is
   overdue" and "what is unassigned" across every board, and nothing asks it.
 - **Editing an automation rule.** The uncomfortable one: `create_automation`
   arms a standing rule and there is no tool to disable, edit or delete it, nor
   to read its run history — which the API does have.
+- **Pressing an automation button.** Deliberate rather than pending: a `manual`
+  rule exists so that a person decides when it runs, and a tool that pressed it
+  would hand that back. Creating one is the safe half and is covered.
 - **Ticket history, duplication and recurrence.**
 - **Sprints** — a whole resource with nothing pointing at it.
 - **Editing and deleting a wiki page.** Waiting on a conflict story; see the
   wiki section above. Removing a whole wiki (`DELETE /wikis/:wiki_uuid`, which
-  archives it and every page under it) is in the same group and is the furthest
-  from a tool of anything here — nothing in that plugin reverses it.
+  archives it and every page under it) is in the same group: it takes a wiki's
+  published pages off the internet in the same instant it archives them, which
+  is consent, not editing. Its restore route is covered instead, by
+  `restore_wiki`, now that `list_wikis` can find an archived uuid to give it.
 - **Imports and feedback forms.**
 - **The published-links inventory.** `GET /workspaces/:uuid/published` answers
   "what of ours is on the public internet right now", and the two DELETEs beside
@@ -220,6 +263,13 @@ read a ticket's attachments while every check stayed green.
 - **Workspace and membership administration.** A key acts as the person who
   created it; renaming or deleting their workspace, or answering an invitation
   for them, reaches further than delegating a board task ever meant.
+- **The whole-workspace export.** `POST /workspaces/:uuid/exports` and the
+  routes beside it build one file holding every ticket, comment and wiki page in
+  the workspace, and they refuse a key before looking at anything else. A key in
+  a CI variable that could ask for one turns any leak of it into a full data
+  breach rather than the scoped access it was issued for. Taking a copy of the
+  company's data is a thing a person does, signed in, from Admin, and the audit
+  trail records which person.
 - **Bulk ticket writes.** `POST /tasks/archive` bins a list in one call.
   `archive_ticket`, one at a time, is the deliberate choice.
 - **Trash.** One-way on purpose: an agent can archive and can destroy what it
@@ -434,16 +484,25 @@ server anyone installs. `npx -y @laver/mcp` works regardless — npx runs the
 package's only bin whatever it is called — so nothing in the config snippet
 above depends on the command's name.
 
-**`repository` and `bugs` are deliberately absent.** `github.com/Developyn/laver`
-is private, and npm renders those fields as links on the package page — pointing
-the only two "where does this come from" links at a 404 is worse than having
-neither. `homepage` is `https://laver.app`, which is public and answers. If the
-`mcp/` directory is ever mirrored to a public repo, add them back:
+**`repository` and `bugs` point at the public mirror.** They were absent while
+`github.com/Developyn/laver` was the only home — it is private, npm renders both
+fields as links on the package page, and aiming the only two "where does this
+come from" links at a 404 is worse than having neither. Since August 2026 the
+published files are mirrored to `github.com/Developyn/laver-mcp`, which is
+public, so both now resolve. Note there is no `"directory"` key: the mirror's
+root *is* the package, whereas here the same files live under `mcp/`.
 
-```json
-"repository": { "type": "git", "url": "git+https://github.com/<org>/<repo>.git", "directory": "mcp" },
-"bugs": { "url": "https://github.com/<org>/<repo>/issues" }
-```
+The mirror is what every MCP directory anchors a listing to, so it has to keep
+up. After each publish, copy the published tarball's contents over it —
+`npm pack @laver/mcp && tar xzf laver-mcp-<version>.tgz` — and commit. Its
+`Dockerfile`, `glama.json` and CI workflow are mirror-only and are not in
+`files`, so they never ship to npm.
+
+**`mcpName` is for the official MCP registry**, which matches the package
+against the server name being published there. It must equal the namespace
+`mcp-publisher login github` actually grants you — `io.github.developyn/…` if it
+authorises the org, `io.github.melvyn-developyn/…` if only the personal account.
+Getting it wrong is not fatal, but correcting it costs another version.
 
 **Before each one**
 
