@@ -1,0 +1,50 @@
+# Build the published server the way a directory does, then make it talk.
+#
+# This repository is a mirror of the @laver/mcp tarball, so the thing worth
+# testing is not the source — it is whether the three files that actually ship
+# still start and describe themselves inside a bare node image. That is the
+# same path Glama takes when it builds the Dockerfile to score the server, and
+# the same one a user takes running it from Docker.
+#
+# The weekly run is not padding. A mirror is only edited when someone
+# remembers to sync it, so months can pass between pushes while the base image
+# and the transitive dependency tree move underneath it. The schedule is what
+# turns "it built in August" into "it builds today".
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  handshake:
+    name: Build the image and complete an MCP handshake
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Plain `docker build`, not a buildx/registry action: the point is to
+      # exercise the Dockerfile exactly as it is written, since that file is
+      # the build spec Glama and every Docker user consume.
+      - name: Build the image
+        run: docker build -t laver-mcp:ci .
+
+      # Speaks initialize / notifications/initialized / tools/list over stdio
+      # and asserts every tool came back with a description and an input
+      # schema. Runs WITHOUT LAVER_API_KEY on purpose — introspection has to
+      # work before a client has any reason to hold a credential.
+      - name: Complete the handshake and list the tools
+        run: node .github/probe.mjs laver-mcp:ci
