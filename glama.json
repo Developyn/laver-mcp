@@ -1,4 +1,25 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "maintainers": ["melvyn-developyn"]
+  "maintainers": ["melvyn-developyn"],
+  "name": "laver-mcp",
+  "title": "Laver",
+  "description": "Kanban boards, sprints, tickets, comments, attachments and a team wiki on laver.app. Every tool is a thin call to the public REST API; writes carry a version, so concurrent agents get a 409 to re-read and retry instead of silently overwriting each other.",
+  "license": "MIT",
+  "language": "JavaScript",
+  "transport": "stdio",
+  "dockerfile": "Dockerfile",
+  "homepage": "https://laver.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Developyn/laver-mcp"
+  },
+  "tags": [
+    "project-management",
+    "kanban",
+    "tickets",
+    "sprints",
+    "wiki",
+    "productivity",
+    "agent-workflow"
+  ]
 }
