@@ -1,6 +1,6 @@
 {
     "name": "@laver/mcp",
-    "version": "0.3.1",
+    "version": "0.4.0",
     "mcpName": "io.github.Developyn/laver-mcp",
     "description": "MCP server for Laver \u2014 drive kanban boards, tickets and the wiki from an agent.",
     "license": "MIT",

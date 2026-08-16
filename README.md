@@ -73,15 +73,31 @@ reconnect from the client's MCP panel) and the tools appear.
 
 **Reading**
 
-| Tool                  | What it gives you                                                                 |
-| --------------------- | --------------------------------------------------------------------------------- |
-| `list_workspaces`     | Where to start when you have no uuids                                             |
-| `list_boards`         | The boards in a workspace                                                         |
-| `get_board`           | A board with its status columns, labels, members and tickets                      |
-| `list_tickets`        | Tickets on a board, filterable, paged — `updated_since` is how you follow a board |
-| `get_ticket`          | One ticket in full, **including its `version`**                                   |
-| `get_ticket_comments` | Comments and activity history                                                     |
-| `search`              | Boards, tickets, wiki pages and comments across a whole workspace at once         |
+| Tool                     | What it gives you                                                                     |
+| ------------------------ | ------------------------------------------------------------------------------------- |
+| `list_workspaces`        | Where to start when you have no uuids                                                 |
+| `list_boards`            | The boards in a workspace                                                             |
+| `get_board`              | A board with its status columns, labels, members and tickets                          |
+| `list_tickets`           | Tickets on a board, filterable, paged — `updated_since` is how you follow a board     |
+| `list_workspace_tickets` | Triage across every board at once — `overdue`, `unassigned`, or free text             |
+| `get_ticket`             | One ticket in full, its subtasks, **including its `version`**                         |
+| `get_ticket_comments`    | Comments and activity history                                                         |
+| `get_ticket_flow`        | How long the ticket has spent in each column                                          |
+| `list_custom_fields`     | A board's custom field definitions — the uuids `update_ticket` writes against         |
+| `list_labels`            | Every label in the workspace, not only the ones already used on one board             |
+| `search`                 | Boards, tickets, wiki pages and comments across a whole workspace at once             |
+
+`list_workspace_tickets` is the stand-up read: it needs no `board_uuid`, and it
+is the only thing here that answers "what is late" and "what does nobody own"
+without walking every board. It is deliberately the small sibling of
+`list_tickets` — one page, 50 by default and 200 at most, no cursor — so narrow
+it rather than paging it.
+
+`get_ticket_flow` derives its numbers from the moves already in a ticket's
+history. Read `visits` rather than the `by_status` totals if you are adding
+several tickets up: tickets worked in one batch overlap, and their totals do not.
+`gaps` says when the history and the ticket's current column disagree, which
+makes the totals a floor rather than a measurement.
 
 To follow a board, call `list_tickets` again with `updated_since` set to the
 `server_time` the previous call returned; you get back the tickets that changed
@@ -115,11 +131,62 @@ that one takes `status` and `limit` as well.
 | `update_ticket`     | Needs `version`; markdown in `description` is parsed; `custom_fields` is keyed by field uuid and **replaces** the whole object |
 | `move_ticket`       | Needs `version`, and a column — neither column is a 400                                                                        |
 | `comment_on_ticket` | Markdown in `body` is parsed; no `version`, so it cannot 409                                                                   |
+| `update_comment`    | Your own comments only; replaces the whole body and is marked as edited                                                       |
+| `delete_comment`    | Your own comments only; to the trash, and nothing here restores one                                                           |
+| `mark_comments_read`| Clears this ticket's unread badge for the user the key acts as                                                                |
+| `add_subtask`       | One checklist item, appended — plain text, not markdown                                                                       |
+| `update_subtask`    | Tick it off (`is_done`), rename it, or move it up the list                                                                    |
+| `delete_subtask`    | **Not** recoverable — a checklist item has no trash                                                                            |
 | `archive_ticket`    | To the trash — **recoverable** for 30 days                                                                                     |
 | `delete_ticket`     | Destroys one already in the trash — **permanent**                                                                              |
 | `create_board`      | Optionally from a template — `crm` or `sales-leads`                                                                            |
 | `link_tickets`      | "this before that" — direction is `blocks` or `blocked_by`                                                                     |
 | `unlink_tickets`    | From either end, and removes **every** kind of link on the pair                                                                |
+
+Comments are not versioned, so none of the three comment writes takes a
+`version` and none of them can 409 — the last edit wins. Only the author may
+edit or delete one, and somebody else's is a 404 indistinguishable from a
+comment that does not exist, so these never report who wrote what.
+`get_ticket_comments` deliberately marks nothing read; `mark_comments_read` is
+the only call that does, and it marks up to the newest comment that exists at
+that moment rather than subscribing.
+
+Subtasks are the checklist on a ticket — a progress count on the card, and where
+acceptance criteria belong when they are meant to be ticked off one at a time.
+`get_ticket` returns the items themselves, so there is no separate list tool.
+
+**Board structure**
+
+| Tool                  | Notes                                                                       |
+| --------------------- | --------------------------------------------------------------------------- |
+| `create_status`       | A new column, appended to the right-hand end                                |
+| `update_status`       | Rename, recolour, or set `is_complete` — a board has at most one            |
+| `reorder_statuses`    | The **complete** list of uuids, in order; a stale list is a 409             |
+| `delete_status`       | The column must be empty, and a board keeps one                            |
+| `create_group`        | A swimlane; there is no rename route, so a wrong name is deleted and remade |
+| `reorder_groups`      | Same complete-list contract as `reorder_statuses`                          |
+| `delete_group`        | Tickets in it survive, ungrouped — and their versions all move             |
+| `create_custom_field` | Workspace owner or admin; `type` cannot be changed afterwards               |
+| `update_custom_field` | Rename, reorder, or replace a select's whole `options` list                |
+| `delete_custom_field` | Takes every ticket's value in that field with it — no trash, no restore     |
+
+This is what a board an agent creates needs to stop being its template's
+defaults. The two reorder tools want the whole list because a partial one is how
+two simultaneous reorders silently drop a column: read the uuids off `get_board`
+immediately before calling, and re-read on a 409.
+
+**Labels**
+
+| Tool           | Notes                                                                    |
+| -------------- | ------------------------------------------------------------------------ |
+| `list_labels`  | Workspace-wide, alphabetical — `get_board` shows only what a board uses  |
+| `create_label` | A hex colour is required; names are unique ignoring case and space       |
+| `update_label` | Renames it **everywhere** — one label, not a copy per board              |
+| `delete_label` | Removes it from every ticket that carries it                             |
+
+A label is a workspace object shared by every board, which is the thing to be
+sure of before renaming one: it changes for everybody. The uuids these return
+are what `update_ticket` takes as `label_uuids`.
 
 **Attachments**
 
@@ -176,22 +243,45 @@ literal text rather than interpreted.
 
 **Automations**
 
-| Tool                | Notes                                                 |
-| ------------------- | ----------------------------------------------------- |
-| `list_automations`  | The rules on a board, each with its `version`         |
-| `create_automation` | Owner or admin only — and see below before calling it |
+| Tool                   | Notes                                                            |
+| ---------------------- | ---------------------------------------------------------------- |
+| `list_automations`     | The rules on a board, each with its `version`                    |
+| `get_automation`       | One rule in full — the conditions and actions an edit replaces   |
+| `list_automation_runs` | What a rule has actually done, newest first                      |
+| `create_automation`    | Owner or admin only — and see below before calling it            |
+| `update_automation`    | Needs `version`; `enabled: false` is the reversible stop         |
+| `delete_automation`    | Needs `version`, and takes the rule's whole run history with it  |
 
 An automation rule is a trigger, optional conditions and up to twenty actions,
-stored against a board. Two things about them are worth knowing before an agent
-touches either tool:
+stored against a board. Three things about them are worth knowing before an
+agent touches these tools:
 
 - **A rule created here is live immediately.** It fires on its trigger within a
-  couple of seconds. Do not create one speculatively to see what it would do:
-  there is no run-history tool here, so you would not see what happened.
+  couple of seconds, so read `list_automation_runs` afterwards rather than
+  creating one speculatively to see what it would do.
 - **A rule is a standing grant.** It runs as the user this key acts as, every
   time it is triggered, for as long as it exists — not once, like every other
   write in this server. Revoking the key does not stop it; disabling or deleting
   the rule does.
+- **Pause before you delete.** `update_automation` with `enabled: false` stops a
+  misbehaving rule at once and keeps its history; deleting destroys the history
+  along with the rule. `conditions` and `actions` replace the stored lists rather
+  than merging into them, so build them from `get_automation` and not from
+  memory.
+
+Both writes take the rule's `version` and answer 409 with the current one, the
+same contract ticket writes have.
+
+**Published links**
+
+`list_published_links` is the inventory read: what of this workspace's is on the
+public internet right now, each row with its share token, who published it, when,
+and how many strangers have looked. `live` is what a stranger actually gets and
+`dark_reason` says why a row is not, which is the only way to find a published
+page that is currently archived and would go straight back online if somebody
+restored it. Workspace owner or admin only; an ordinary member is a 403. Taking
+a link back down is deliberately not a tool — report what is published and let a
+person decide what comes off.
 
 ## Not covered
 
@@ -204,22 +294,18 @@ read a ticket's attachments while every check stayed green.
 
 **Not yet** — wanted, not built:
 
-- **Notifications.** The biggest gap. An agent cannot see that it was mentioned
-  or assigned, so the only way to find work aimed at it is to poll every board.
-- **Subtasks.** Readable now, not writable. `get_ticket` used to give you "3 of
-  7 done" and never the seven; it now returns the items themselves, so
-  acceptance criteria written as a checklist can be read. Ticking one off still
-  needs the REST API.
-- **How long a ticket spent in each column.** `GET /tasks/:task_uuid/flow`
-  derives it from the moves already in the ticket's history and has no tool yet.
-  Read `visits` rather than the totals if you are adding several tickets up:
-  tickets worked in one batch overlap, and their totals do not.
-- **Comment editing and read state.** Comments can be posted and never amended
-  or retracted, and an unread badge an agent caused cannot be cleared.
-- **Board structure.** Statuses, groups and custom fields have full CRUD in
-  REST and no tools, so a board created here keeps its template's defaults.
-- **Labels.** `update_ticket` takes `label_uuids`; the only source of one is
-  `get_board`. Nothing creates a label or lists them workspace-wide.
+- **Notifications.** Still the biggest gap, and now blocked on something a tool
+  cannot fix: an agent cannot see that it was mentioned or assigned, and
+  `backend/notifications/index.js` installs `session_only` on the whole plugin,
+  so every route there answers a key with a 401 however good the tool is.
+  Adding one means first deciding whether a key may read its owner's inbox at
+  all — a surface carrying other people's messages — which is a product and
+  security call rather than a delivery task. `list_workspace_tickets` covers the
+  triage half and is the closest substitute meanwhile.
+- **Listing subtasks on their own.** Needs no tool rather than lacking one:
+  `get_ticket` already returns the checklist items themselves — uuid, title and
+  done state — so a dedicated list route would be a second way to ask the same
+  question. Writing them is covered.
 - **Board templates.** A workspace can save one of its own boards as a template
   and start the next board from it. Listing them has no tool, which is what
   keeps the saved ones out of reach: `create_board` names the two built-in ids
@@ -232,16 +318,22 @@ read a ticket's attachments while every check stayed green.
   megabytes; an agent wants the file somebody actually uploaded, and
   `get_ticket_attachment` already returns that at full resolution in its
   original format.
-- **Triage and board analytics.** `GET /workspaces/:uuid/tasks` answers "what is
-  overdue" and "what is unassigned" across every board, and nothing asks it.
-- **Editing an automation rule.** The uncomfortable one: `create_automation`
-  arms a standing rule and there is no tool to disable, edit or delete it, nor
-  to read its run history — which the API does have.
+- **Board analytics.** A small loss now that the triage half is covered by
+  `list_workspace_tickets`. What is left is shaped for charts rather than for a
+  decision: stats and board-wide flow are aggregates a person reads on a screen,
+  activity is a feed, search-text serves find-as-you-type, and export hands back
+  a file. `get_ticket_flow` covers the one figure an agent acts on, per ticket,
+  where it can be attributed.
 - **Pressing an automation button.** Deliberate rather than pending: a `manual`
   rule exists so that a person decides when it runs, and a tool that pressed it
   would hand that back. Creating one is the safe half and is covered.
 - **Ticket history, duplication and recurrence.**
-- **Sprints** — a whole resource with nothing pointing at it.
+- **Sprints.** Blocked in the same place notifications are:
+  `backend/sprints/index.js` installs `session_only` on the plugin, so a key gets
+  a 401 from every route there — `POST /boards/:uuid/sprints` included. Opening
+  them to keys is a decision about what a key may do to a team's planning cadence
+  (a rollover migrates every unfinished ticket onto a new board), not a matter of
+  writing the tools.
 - **Editing and deleting a wiki page.** Waiting on a conflict story; see the
   wiki section above. Removing a whole wiki (`DELETE /wikis/:wiki_uuid`, which
   archives it and every page under it) is in the same group: it takes a wiki's
@@ -249,17 +341,35 @@ read a ticket's attachments while every check stayed green.
   is consent, not editing. Its restore route is covered instead, by
   `restore_wiki`, now that `list_wikis` can find an archived uuid to give it.
 - **Imports and feedback forms.**
-- **The published-links inventory.** `GET /workspaces/:uuid/published` answers
-  "what of ours is on the public internet right now", and the two DELETEs beside
-  it take one link back down. One screen, one sitting, no agent story yet. The
-  read is the half to add first if anybody asks; it grants no power the caller
-  does not already have.
 
 **Not ever, from a key:**
 
 - **Public links and publishing.** Publishing turns something private into
   something anyone with the URL can read. That is consent, and a tool call is
   the wrong shape for it.
+- **Taking a published link back down.** The read shipped and the two DELETEs
+  did not, which is the same split: a tool cannot carry consent, and that says
+  nothing about ASKING what is public. `list_published_links` answers the
+  question and grants no power the caller did not already have, since every link
+  it names is public by definition. Retracting one is a bounded admin power
+  exercised in front of a screen showing what is about to go dark, so an agent
+  reports the inventory and a person decides what comes down.
+- **Taking a board away, and how it looks.** The structure half of this group is
+  covered — statuses, groups and custom fields all have tools. What is left is
+  removal and decoration. Archiving and deleting a board are one write under two
+  names, and a tool over either would let a key take a whole board and every
+  ticket on it out of the workspace's view in one call; restore is uncovered as
+  a consequence, since nothing an agent can do archives a board and `list_boards`
+  deliberately cannot find an archived uuid. Permanent deletion is firmer still
+  — the row, its tickets and their attachments' bytes all go — and is a person's
+  decision made twice, from a screen showing what they are about to lose. The
+  board's colour and background picture are decoration chosen while looking at
+  the board, which is the one thing an agent cannot do. A column's entry
+  requirements sit here too: the read needs no tool, because `get_board` already
+  sends each column's `entry_requirements` and a refused `move_ticket` names
+  every one the ticket does not meet — but a key that could set them could
+  remove them and then move the ticket, so the gate would only be as strong as
+  the weakest tool over it.
 - **Workspace and membership administration.** A key acts as the person who
   created it; renaming or deleting their workspace, or answering an invitation
   for them, reaches further than delegating a board task ever meant.
